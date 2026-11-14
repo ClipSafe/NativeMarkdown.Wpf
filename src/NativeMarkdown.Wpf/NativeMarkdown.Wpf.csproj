@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <AssemblyName>NativeMarkdown.Wpf</AssemblyName>
+    <RootNamespace>NativeMarkdown.Wpf</RootNamespace>
+
+    <PackageId>NativeMarkdown.Wpf</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>ClipSafe</Authors>
+    <Product>NativeMarkdown.Wpf</Product>
+    <Description>A fast, native WPF Markdown renderer built on Markdig. Renders into a FlowDocument with incremental block updates, so live previews update without flicker and without WebView.</Description>
+    <PackageTags>markdown;wpf;markdown-viewer;markdig;native;preview;flowdocument</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <IsPackable>true</IsPackable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <RepositoryUrl>https://github.com/ClipSafe/NativeMarkdown.Wpf</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/ClipSafe/NativeMarkdown.Wpf</PackageProjectUrl>
+    <Copyright>Copyright © ClipSafe</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Markdig" Version="1.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="icon.png" Pack="true" PackagePath="\" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\CHANGELOG.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NativeMarkdown.Wpf.Tests" />
+  </ItemGroup>
+
+</Project>
+
