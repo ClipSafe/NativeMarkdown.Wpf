@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 — 2026-11-14
+
+- New package icon in the ClipSafe palette.
+- Small documentation tidy-ups.
+
 ## 1.0.0 — 2026-11-14
 
 First public release.
