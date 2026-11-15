@@ -11,7 +11,7 @@
     <RootNamespace>NativeMarkdown.Wpf</RootNamespace>
 
     <PackageId>NativeMarkdown.Wpf</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>ClipSafe</Authors>
     <Product>NativeMarkdown.Wpf</Product>
     <Description>A fast, native WPF Markdown renderer built on Markdig. Renders into a FlowDocument with incremental block updates, so live previews update without flicker and without WebView.</Description>

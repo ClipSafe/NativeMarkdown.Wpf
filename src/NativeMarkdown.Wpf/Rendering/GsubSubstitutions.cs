@@ -43,7 +43,7 @@ internal sealed class GsubSubstitutions
         {
             var lookup = lookupList + OpenTypeTables.ReadU16(data, lookupList + 2u + ((uint)i * 2u));
             var type = OpenTypeTables.ReadU16(data, lookup);
-            if (type is not (4 or 6))
+            if (type is not (1 or 4 or 6))
                 continue;
 
             var subTableCount = OpenTypeTables.ReadU16(data, lookup + 4);
@@ -99,6 +99,7 @@ internal sealed class GsubSubstitutions
         {
             var changed = lookup.Type switch
             {
+                1 => ApplySingle(subTable, glyphs, index),
                 4 => ApplyLigature(subTable, glyphs, index),
                 6 => ApplyChainContext(subTable, glyphs, index, depth),
                 _ => false
@@ -106,6 +107,38 @@ internal sealed class GsubSubstitutions
 
             if (changed)
                 return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// One glyph replaced by another. Emoji fonts use these inside contextual rules to pick the
+    /// half-figures that make up multi-person sequences, so they are needed for families to compose.
+    /// </summary>
+    private bool ApplySingle(uint subTable, List<ushort> glyphs, int index)
+    {
+        var format = OpenTypeTables.ReadU16(_data, subTable);
+        var coverage = OpenTypeCoverage.Read(_data, subTable + OpenTypeTables.ReadU16(_data, subTable + 2));
+        var covered = coverage.IndexOf(glyphs[index]);
+        if (covered < 0)
+            return false;
+
+        if (format == 1)
+        {
+            var delta = OpenTypeTables.ReadI16(_data, subTable + 4);
+            glyphs[index] = (ushort)(glyphs[index] + delta);
+            return true;
+        }
+
+        if (format == 2)
+        {
+            var substituteCount = OpenTypeTables.ReadU16(_data, subTable + 4);
+            if (covered >= substituteCount)
+                return false;
+
+            glyphs[index] = OpenTypeTables.ReadU16(_data, subTable + 6u + ((uint)covered * 2u));
+            return true;
         }
 
         return false;

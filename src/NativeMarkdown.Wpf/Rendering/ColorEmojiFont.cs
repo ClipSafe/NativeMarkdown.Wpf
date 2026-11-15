@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 
 namespace NativeMarkdown.Wpf.Rendering;
 
@@ -19,6 +20,11 @@ internal sealed class ColorEmojiFont
 
     /// <summary>A composed emoji must stay close to a single em, otherwise the font did not compose it.</summary>
     private const double MaxComposedWidthEm = 1.6;
+
+    private const char AsciiLimit = '\u0080';
+
+    /// <summary>Lowest character the emoji font may colorize; below it only plain text exists.</summary>
+    private const char LowestEmojiCharacter = '\u00A9';
 
     private static readonly ConcurrentDictionary<string, ColorEmojiFont?> Fonts = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<(string Cluster, string Font), EmojiArt?> Art = new();
@@ -77,6 +83,71 @@ internal sealed class ColorEmojiFont
             return null;
 
         return Art.GetOrAdd((cluster, _glyphTypeface.FamilyNames.Values.FirstOrDefault() ?? string.Empty), _ => Build(cluster));
+    }
+
+    /// <summary>
+    /// Splits text into plain runs and emoji that have color art. Used by both the document renderer
+    /// and the plain-text helper so both agree on where an emoji starts and ends.
+    /// </summary>
+    public static List<EmojiTextSegment> Segment(string text, ColorEmojiFont? font)
+    {
+        var segments = new List<EmojiTextSegment>();
+        if (text.Length == 0)
+            return segments;
+
+        // Fast path: prose has nothing to resolve, and scanning it per grapheme cluster is expensive.
+        if (font is null || !MayContainEmoji(text))
+        {
+            segments.Add(new EmojiTextSegment(0, text.Length, null));
+            return segments;
+        }
+
+        var plainStart = 0;
+        var index = 0;
+
+        while (index < text.Length)
+        {
+            if (text[index] < AsciiLimit)
+            {
+                index++;
+                continue;
+            }
+
+            var length = StringInfo.GetNextTextElementLength(text.AsSpan(index));
+            if (length <= 0)
+                break;
+
+            if (font.Resolve(text.Substring(index, length)) is EmojiArt art)
+            {
+                if (index > plainStart)
+                    segments.Add(new EmojiTextSegment(plainStart, index - plainStart, null));
+
+                segments.Add(new EmojiTextSegment(index, length, art));
+                plainStart = index + length;
+            }
+
+            index += length;
+        }
+
+        if (plainStart < text.Length)
+            segments.Add(new EmojiTextSegment(plainStart, text.Length - plainStart, null));
+
+        return segments;
+    }
+
+    /// <summary>
+    /// Cheap check for characters that could begin an emoji. Below the copyright sign there is nothing
+    /// the emoji font colorizes, so plain ASCII and Latin text skips the expensive path entirely.
+    /// </summary>
+    private static bool MayContainEmoji(string text)
+    {
+        foreach (var character in text)
+        {
+            if (character >= LowestEmojiCharacter)
+                return true;
+        }
+
+        return false;
     }
 
     private static ColorEmojiFont? Load(FontFamily family)
@@ -298,7 +369,17 @@ internal sealed class ColorEmojiFont
 }
 
 /// <summary>Frozen vector art for one emoji, sized in em units.</summary>
-internal readonly record struct EmojiArt(ImageSource Image, double WidthEm, double HeightEm)
+/// <param name="Image">The art itself, drawn in the emoji font's own colors.</param>
+/// <param name="WidthEm">Advance width in em, so callers can size it against their own font size.</param>
+/// <param name="HeightEm">Height in em.</param>
+public readonly record struct EmojiArt(ImageSource Image, double WidthEm, double HeightEm)
 {
+    /// <summary>Returns the art size in device independent pixels for the given em size.</summary>
     public Size Scale(double emSize) => new(WidthEm * emSize, HeightEm * emSize);
 }
+
+/// <summary>A stretch of source text, optionally carrying the color art for an emoji.</summary>
+/// <param name="Start">Index of the first character in the source text.</param>
+/// <param name="Length">Number of characters the segment covers.</param>
+/// <param name="Art">Color art when the segment is a single emoji the font can draw in color.</param>
+public readonly record struct EmojiTextSegment(int Start, int Length, EmojiArt? Art);

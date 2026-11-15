@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.2 - 2026-11-15
+
+- New `EmojiText` attached property draws color emoji inside a plain `TextBlock`, so sidebar rows,
+  window titles and any other read-only text match the viewer. Text without emoji still goes to
+  `TextBlock.Text`, which keeps `CharacterEllipsis` trimming exact.
+- New `RenderOnInputIdle` queues renders behind pending input. A live editor no longer pays for the
+  preview inside the keystroke, and several fast keystrokes collapse into one render.
+- Large documents are built in slices, so opening or pasting a big note keeps the window responsive.
+  Slices pause while the scroll position is changing.
+- New `RenderCompleted` event and `IsRendering` property, so a host can tell when a render finished,
+  including one built in slices.
+- New `Zoom` property, clamped to 50 to 300 percent. Ctrl+wheel zooms whether or not a scrollbar is
+  present, and the optional `ShowZoomIndicator` shows the level in the corner for a moment.
+- Emoji composition is better: the renderer now applies the font's own single substitutions and
+  positioning rules, so three person families and couples draw as one emoji instead of separate
+  people. Four person families and flags are still drawn as text because the font has no compact
+  picture for them.
+- Emoji scanning skips text that cannot contain emoji, so ordinary paragraphs cost less.
+- Emoji characters stay in the document at an invisible size, so selecting and copying the preview
+  keeps them.
+
 ## 1.0.1 — 2026-11-14
 
 - New package icon in the ClipSafe palette.

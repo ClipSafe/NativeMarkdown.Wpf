@@ -17,6 +17,9 @@ namespace NativeMarkdown.Wpf.Rendering;
 
 internal sealed partial class MarkdownBlockRenderer
 {
+    /// <summary>Size of the invisible emoji character kept in the document so copying keeps it.</summary>
+    private const double CopiedEmojiFontSize = 0.05;
+
     private void AppendInlines(InlineCollection target, ContainerInline? container, double emSize)
     {
         if (container is null)
@@ -218,60 +221,54 @@ internal sealed partial class MarkdownBlockRenderer
         if (!_options.ColorEmoji)
             return false;
 
-        var hasNonAscii = false;
-        foreach (var character in text)
-        {
-            if (character < 0x80)
-                continue;
-
-            hasNonAscii = true;
-            break;
-        }
-
-        if (!hasNonAscii)
-            return false;
-
         var emoji = _emoji ??= ColorEmojiFont.ForFamily(_options.EmojiFontFamily);
         if (emoji is null)
             return false;
 
-        var start = 0;
-        var index = 0;
-
-        while (index < text.Length)
+        var segments = ColorEmojiFont.Segment(text, emoji);
+        var hasEmoji = false;
+        foreach (var segment in segments)
         {
-            var length = StringInfo.GetNextTextElementLength(text.AsSpan(index));
-            if (length <= 0)
-                break;
+            if (segment.Art is null)
+                continue;
 
-            if (emoji.Resolve(text.Substring(index, length)) is EmojiArt art)
-            {
-                if (index > start)
-                    target.Add(new Run(text[start..index]));
-
-                var size = art.Scale(emSize);
-                target.Add(new InlineUIContainer(new Image
-                {
-                    Source = art.Image,
-                    Width = size.Width,
-                    Height = size.Height,
-                    Stretch = Stretch.Fill
-                })
-                {
-                    BaselineAlignment = BaselineAlignment.Bottom
-                });
-
-                start = index + length;
-            }
-
-            index += length;
+            hasEmoji = true;
+            break;
         }
 
-        if (start == 0)
+        if (!hasEmoji)
             return false;
 
-        if (start < text.Length)
-            target.Add(new Run(text[start..]));
+        foreach (var segment in segments)
+        {
+            var value = text.Substring(segment.Start, segment.Length);
+
+            if (segment.Art is not EmojiArt art)
+            {
+                target.Add(new Run(value));
+                continue;
+            }
+
+            var size = art.Scale(emSize);
+            target.Add(new InlineUIContainer(new Image
+            {
+                Source = art.Image,
+                Width = size.Width,
+                Height = size.Height,
+                Stretch = Stretch.Fill
+            })
+            {
+                BaselineAlignment = BaselineAlignment.Bottom
+            });
+
+            // Keep the character itself in the document at a size too small to see, so selecting and
+            // copying the preview keeps the emoji instead of dropping it.
+            target.Add(new Run(value)
+            {
+                FontSize = CopiedEmojiFontSize,
+                Foreground = Brushes.Transparent
+            });
+        }
 
         return true;
     }

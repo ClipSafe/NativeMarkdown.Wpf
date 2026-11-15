@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -186,6 +187,81 @@ public class MarkdownViewerTests
     }
 
     [Fact]
+    public void Zoom_is_clamped_to_the_supported_range()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer { Markdown = "Body" };
+            Assert.Equal(100, viewer.Zoom);
+
+            viewer.Zoom = 900;
+            Assert.Equal(300, viewer.Zoom);
+
+            viewer.Zoom = 10;
+            Assert.Equal(50, viewer.Zoom);
+
+            viewer.Zoom = double.NaN;
+            Assert.Equal(100, viewer.Zoom);
+        });
+    }
+
+    [Fact]
+    public void Zoom_badge_appears_only_when_the_indicator_is_enabled()
+    {
+        StaThread.Run(() =>
+        {
+            var plain = new MarkdownViewer { Markdown = "Body" };
+            LoadViewer(plain);
+            plain.Zoom = 150;
+            plain.UpdateLayout();
+
+            Assert.Equal(1, VisualTreeHelper.GetChildrenCount(plain));
+
+            var viewer = new MarkdownViewer { Markdown = "Body", ShowZoomIndicator = true };
+            LoadViewer(viewer);
+            viewer.Zoom = 125;
+            viewer.UpdateLayout();
+
+            Assert.Equal(2, VisualTreeHelper.GetChildrenCount(viewer));
+
+            var badge = Assert.IsType<Border>(VisualTreeHelper.GetChild(viewer, 1));
+            Assert.Equal(Visibility.Visible, badge.Visibility);
+            Assert.False(badge.IsHitTestVisible);
+            Assert.Equal("125%", Assert.IsType<TextBlock>(badge.Child).Text);
+            Assert.True(badge.ActualWidth > 0);
+
+            // Bottom right corner, clear of the scrollbar.
+            var corner = badge.TranslatePoint(new Point(badge.ActualWidth, badge.ActualHeight), viewer);
+            Assert.InRange(corner.X, viewer.ActualWidth - 40, viewer.ActualWidth + 0.5);
+            Assert.InRange(corner.Y, viewer.ActualHeight - 32, viewer.ActualHeight + 0.5);
+        });
+    }
+
+    [Fact]
+    public void Zoom_badge_hides_itself_after_the_change()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer { Markdown = "Body", ShowZoomIndicator = true };
+            LoadViewer(viewer);
+            viewer.Zoom = 140;
+            viewer.UpdateLayout();
+
+            var badge = Assert.IsType<Border>(VisualTreeHelper.GetChild(viewer, 1));
+            Assert.Equal(Visibility.Visible, badge.Visibility);
+
+            var watch = Stopwatch.StartNew();
+            while (badge.Visibility == Visibility.Visible && watch.ElapsedMilliseconds < 4000)
+            {
+                Thread.Sleep(50);
+                DoEvents();
+            }
+
+            Assert.Equal(Visibility.Collapsed, badge.Visibility);
+        });
+    }
+
+    [Fact]
     public void Renders_single_emoji_as_color_art()
     {
         StaThread.Run(() =>
@@ -194,12 +270,188 @@ public class MarkdownViewerTests
 
             var paragraph = Assert.IsType<Paragraph>(viewer.CachedBlocks[0].Block);
             var container = paragraph.Inlines.OfType<InlineUIContainer>().Single();
-            var image = Assert.IsType<Image>(container.Child);
-            Assert.NotNull(image.Source);
-            Assert.True(image.Width > 0);
-            Assert.True(image.Height > 0);
-            Assert.DoesNotContain("\U0001F680", GetText(paragraph));
+            var element = Assert.IsAssignableFrom<FrameworkElement>(container.Child);
+            Assert.True(element.Width > 0);
+            Assert.True(element.Height > 0);
+
+            // The character stays in the document so copying the preview keeps the emoji.
+            Assert.Contains("\U0001F680", GetText(paragraph));
         });
+    }
+
+    [Fact]
+    public void Keeps_the_emoji_character_out_of_sight()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer { Markdown = "Launch :rocket:" };
+
+            var paragraph = Assert.IsType<Paragraph>(viewer.CachedBlocks[0].Block);
+            var copied = paragraph.Inlines
+                .OfType<Run>()
+                .Single(run => run.Text.Contains("\U0001F680", StringComparison.Ordinal));
+
+            // Tiny and transparent: text for the clipboard, invisible on screen.
+            Assert.True(copied.FontSize < 1);
+            Assert.Equal(Brushes.Transparent, copied.Foreground);
+        });
+    }
+
+    [Fact]
+    public void Raises_render_completed_for_small_documents_too()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer();
+            var completed = 0;
+            viewer.RenderCompleted += (_, _) => completed++;
+
+            viewer.Markdown = "# Small";
+
+            Assert.False(viewer.IsRendering);
+            Assert.Equal(1, completed);
+        });
+    }
+
+    [Fact]
+    public void Defers_rendering_until_input_idle()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer { RenderOnInputIdle = true };
+            var renders = 0;
+            viewer.RenderCompleted += (_, _) => renders++;
+
+            viewer.Markdown = "# Title";
+
+            // The property change must not render on the input thread.
+            Assert.Empty(viewer.CachedBlocks);
+
+            DoEvents();
+
+            Assert.Single(viewer.CachedBlocks);
+            Assert.Equal(1, renders);
+        });
+    }
+
+    [Fact]
+    public void Collapses_fast_edits_into_one_render()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer { RenderOnInputIdle = true };
+            viewer.Markdown = "# One";
+            DoEvents();
+
+            var renders = 0;
+            viewer.RenderCompleted += (_, _) => renders++;
+
+            for (var i = 0; i < 5; i++)
+                viewer.Markdown = $"# One{i}";
+
+            DoEvents();
+            PumpUntilRendered(viewer);
+
+            Assert.Equal(1, renders);
+            Assert.Equal("One4", GetText(viewer.CachedBlocks[0].Block));
+        });
+    }
+
+    [Fact]
+    public void Renders_large_documents_in_slices()    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer();
+            var completed = 0;
+            viewer.RenderCompleted += (_, _) => completed++;
+
+            viewer.Markdown = BuildDocument(400);
+
+            // The big document is handed to the dispatcher instead of blocking this call.
+            Assert.True(viewer.IsRendering);
+
+            PumpUntilRendered(viewer);
+
+            Assert.Equal(1, completed);
+            Assert.Equal(800, viewer.CachedBlocks.Count);
+        });
+    }
+
+    [Fact]
+    public void Replacing_a_sliced_render_leaves_a_consistent_document()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer();
+            viewer.Markdown = BuildDocument(400);
+            Assert.True(viewer.IsRendering);
+
+            viewer.Markdown = "# Small";
+            PumpUntilRendered(viewer);
+
+            Assert.Single(viewer.CachedBlocks);
+            Assert.Equal("Small", GetText(viewer.CachedBlocks[0].Block));
+        });
+    }
+
+    [Fact]
+    public void Small_edits_to_a_large_document_stay_synchronous()
+    {
+        StaThread.Run(() =>
+        {
+            var viewer = new MarkdownViewer();
+            var markdown = BuildDocument(400);
+            viewer.Markdown = markdown;
+            PumpUntilRendered(viewer);
+
+            viewer.Markdown = markdown.Replace("## Section 0", "## Section zero", StringComparison.Ordinal);
+
+            // Typing must never wait on the dispatcher, so a small change is applied in place.
+            Assert.False(viewer.IsRendering);
+            Assert.Equal(800, viewer.CachedBlocks.Count);
+            Assert.Equal("Section zero", GetText(viewer.CachedBlocks[0].Block));
+        });
+    }
+
+    private static string BuildDocument(int sections)
+    {
+        var builder = new StringBuilder(sections * 120);
+        for (var i = 0; i < sections; i++)
+        {
+            builder.Append("## Section ").Append(i).Append("\n\n");
+            builder.Append("Paragraph with **bold** and `code` and a [link](https://example.com).\n\n");
+        }
+
+        return builder.ToString();
+    }
+
+    private static void PumpUntilRendered(MarkdownViewer viewer, int timeoutMs = 20_000)
+    {
+        var watch = Stopwatch.StartNew();
+        while (viewer.IsRendering && watch.ElapsedMilliseconds < timeoutMs)
+            DoEvents();
+
+        Assert.False(viewer.IsRendering);
+    }
+
+    /// <summary>Lays the viewer out and raises Loaded, so it behaves like one inside a window.</summary>
+    private static void LoadViewer(MarkdownViewer viewer)
+    {
+        viewer.Measure(new Size(600, 400));
+        viewer.Arrange(new Rect(0, 0, 600, 400));
+        viewer.UpdateLayout();
+        viewer.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, viewer));
+        viewer.UpdateLayout();
+    }
+
+    /// <summary>Processes queued dispatcher work once, without needing a window or message loop.</summary>
+    private static void DoEvents()
+    {
+        var frame = new DispatcherFrame();
+        Dispatcher.CurrentDispatcher.BeginInvoke(
+            DispatcherPriority.Background,
+            new Action(() => frame.Continue = false));
+        Dispatcher.PushFrame(frame);
     }
 
     [Fact]
@@ -243,13 +495,27 @@ public class MarkdownViewerTests
     }
 
     [Fact]
-    public void Keeps_multi_glyph_sequences_as_text()
+    public void Composes_multi_person_families()
     {
         StaThread.Run(() =>
         {
-            // The font composes this family from several glyphs positioned by the font itself, so the
-            // renderer deliberately keeps it as text instead of drawing stacked, incorrect art.
-            const string family = "\U0001F469\U0001F3FF\u200D\U0001F469\U0001F3FB\u200D\U0001F466\U0001F3FD";
+            // Three-person families compose into one picture through the font's contextual single
+            // substitutions; before those were handled these stayed monochrome text.
+            var viewer = new MarkdownViewer { Markdown = "\U0001F468\u200D\U0001F469\u200D\U0001F467" };
+
+            var paragraph = Assert.IsType<Paragraph>(viewer.CachedBlocks[0].Block);
+            Assert.Single(paragraph.Inlines.OfType<InlineUIContainer>());
+        });
+    }
+
+    [Fact]
+    public void Keeps_sequences_it_cannot_compose_as_text()
+    {
+        StaThread.Run(() =>
+        {
+            // This font exposes no composition for four-person families, so it stays as text rather
+            // than drawing the parts stacked on top of each other.
+            const string family = "\U0001F468\u200D\U0001F468\u200D\U0001F467\u200D\U0001F466";
             var viewer = new MarkdownViewer { Markdown = family };
 
             var paragraph = Assert.IsType<Paragraph>(viewer.CachedBlocks[0].Block);

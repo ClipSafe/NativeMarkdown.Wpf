@@ -1,6 +1,7 @@
 using Markdig.Syntax;
 using NativeMarkdown.Wpf.Rendering;
 using System.Diagnostics;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -20,6 +21,36 @@ public sealed class MarkdownViewer : FrameworkElement
 {
     private const double WheelScrollPageFraction = 0.15;
     private const double MouseWheelDeltaPerNotch = 120d;
+    private const double ZoomStep = 10;
+    private const double MinZoomPercent = 50;
+    private const double MaxZoomPercent = 300;
+
+    /// <summary>Documents at least this large are built in slices so the UI thread stays responsive.</summary>
+    private const int HeavyBlockThreshold = 150;
+
+    /// <summary>A change smaller than this is applied synchronously, which is what keeps typing instant.</summary>
+    private const int SmallChangeThreshold = 30;
+
+    private const int RenderSliceMilliseconds = 120;
+
+    /// <summary>
+    /// A sliced render aims for at most this many pauses. Every pause costs one full document layout,
+    /// so fewer, larger slices are much cheaper than many small ones.
+    /// </summary>
+    private const int SliceTargetCount = 6;
+
+    private const int MinBlocksPerSlice = 20;
+
+    /// <summary>How long the pointer must be still before a paused slice resumes.</summary>
+    private const int InteractionQuietMilliseconds = 250;
+
+    private const int SliceResumeDelayMilliseconds = 100;
+
+    /// <summary>How long the zoom badge stays on screen after the zoom level changes.</summary>
+    private const int ZoomBadgeVisibleMilliseconds = 1400;
+
+    /// <summary>Distance between the zoom badge and the bottom right corner of the viewer.</summary>
+    private static readonly Thickness ZoomBadgeInset = new(0, 0, 28, 20);
 
     private static readonly FontFamily DefaultFontFamily =
         new("Segoe UI Variable Text, Segoe UI, Segoe UI Emoji, Segoe UI Symbol");
@@ -169,6 +200,27 @@ public sealed class MarkdownViewer : FrameworkElement
         typeof(MarkdownViewer),
         new FrameworkPropertyMetadata(true, OnStyleChanged));
 
+    /// <summary>Identifies the <see cref="RenderOnInputIdle"/> dependency property.</summary>
+    public static readonly DependencyProperty RenderOnInputIdleProperty = DependencyProperty.Register(
+        nameof(RenderOnInputIdle),
+        typeof(bool),
+        typeof(MarkdownViewer),
+        new FrameworkPropertyMetadata(false));
+
+    /// <summary>Identifies the <see cref="Zoom"/> dependency property.</summary>
+    public static readonly DependencyProperty ZoomProperty = DependencyProperty.Register(
+        nameof(Zoom),
+        typeof(double),
+        typeof(MarkdownViewer),
+        new FrameworkPropertyMetadata(100d, OnZoomChanged, CoerceZoom));
+
+    /// <summary>Identifies the <see cref="ShowZoomIndicator"/> dependency property.</summary>
+    public static readonly DependencyProperty ShowZoomIndicatorProperty = DependencyProperty.Register(
+        nameof(ShowZoomIndicator),
+        typeof(bool),
+        typeof(MarkdownViewer),
+        new FrameworkPropertyMetadata(false));
+
     private readonly MarkdownDocumentRenderer _parser = new();
     private readonly FlowDocument _document;
     private readonly FlowDocumentScrollViewer _host;
@@ -180,6 +232,15 @@ public sealed class MarkdownViewer : FrameworkElement
     private string _renderedMarkdown = string.Empty;
     private ScrollViewer? _scrollViewer;
     private bool _isRendering;
+    private RenderJob? _pendingRender;
+    private bool _renderQueued;
+    private bool _queuedRenderForced;
+    private long _lastInteractionTimestamp;
+    private DispatcherTimer? _slicePauseTimer;
+    private Border? _zoomBadge;
+    private TextBlock? _zoomBadgeText;
+    private DispatcherTimer? _zoomBadgeTimer;
+    private bool _hasLoaded;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MarkdownViewer"/> class.
@@ -200,7 +261,9 @@ public sealed class MarkdownViewer : FrameworkElement
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             IsSelectionEnabled = true,
             Focusable = true,
-            Background = Background
+            Background = Background,
+            MinZoom = MinZoomPercent,
+            MaxZoom = MaxZoomPercent
         };
 
         _host.ContextMenu = CreateContextMenu();
@@ -212,6 +275,7 @@ public sealed class MarkdownViewer : FrameworkElement
         UpdatePagePadding();
 
         Loaded += OnLoaded;
+        IsVisibleChanged += OnIsVisibleChanged;
         SizeChanged += (_, _) => UpdatePagePadding();
     }
 
@@ -219,6 +283,16 @@ public sealed class MarkdownViewer : FrameworkElement
     /// Raised when a link in the document is activated.
     /// </summary>
     public event EventHandler<MarkdownLinkClickedEventArgs>? LinkClicked;
+
+    /// <summary>
+    /// Raised when the document has finished rendering, including a render that was built in slices.
+    /// </summary>
+    public event EventHandler? RenderCompleted;
+
+    /// <summary>
+    /// Gets a value indicating whether a render is still being applied to the document.
+    /// </summary>
+    public bool IsRendering => _isRendering || _pendingRender is not null;
 
     /// <summary>
     /// Gets or sets the Markdown source to render.
@@ -395,6 +469,37 @@ public sealed class MarkdownViewer : FrameworkElement
     }
 
     /// <summary>
+    /// Gets or sets a value indicating whether renders are queued behind pending input instead of running
+    /// inside the property change. Leave it off to render immediately; turn it on for a live editor so a
+    /// keystroke never waits for the preview, and several fast keystrokes collapse into one render.
+    /// </summary>
+    public bool RenderOnInputIdle
+    {
+        get => (bool)GetValue(RenderOnInputIdleProperty);
+        set => SetValue(RenderOnInputIdleProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets the zoom level of the document as a percentage. Values are clamped to the supported
+    /// range of 50 to 300.
+    /// </summary>
+    public double Zoom
+    {
+        get => (double)GetValue(ZoomProperty);
+        set => SetValue(ZoomProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether a zoom badge appears in the bottom right corner after the
+    /// zoom level changes. It fades out of the way on its own, and never takes pointer input.
+    /// </summary>
+    public bool ShowZoomIndicator
+    {
+        get => (bool)GetValue(ShowZoomIndicatorProperty);
+        set => SetValue(ShowZoomIndicatorProperty, value);
+    }
+
+    /// <summary>
     /// Scrolls the document back to the beginning.
     /// </summary>
     public void ScrollToTop()
@@ -411,16 +516,21 @@ public sealed class MarkdownViewer : FrameworkElement
     }
 
     /// <inheritdoc />
-    protected override int VisualChildrenCount => 1;
+    protected override int VisualChildrenCount => _zoomBadge is null ? 1 : 2;
 
     /// <inheritdoc />
-    protected override Visual GetVisualChild(int index) =>
-        index == 0 ? _host : throw new ArgumentOutOfRangeException(nameof(index));
+    protected override Visual GetVisualChild(int index) => index switch
+    {
+        0 => _host,
+        1 when _zoomBadge is not null => _zoomBadge,
+        _ => throw new ArgumentOutOfRangeException(nameof(index))
+    };
 
     /// <inheritdoc />
     protected override Size MeasureOverride(Size availableSize)
     {
         _host.Measure(availableSize);
+        _zoomBadge?.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
         return _host.DesiredSize;
     }
 
@@ -428,11 +538,23 @@ public sealed class MarkdownViewer : FrameworkElement
     protected override Size ArrangeOverride(Size finalSize)
     {
         _host.Arrange(new Rect(finalSize));
+
+        if (_zoomBadge is not null)
+        {
+            var size = _zoomBadge.DesiredSize;
+            _zoomBadge.Arrange(new Rect(
+                Math.Max(0, finalSize.Width - size.Width - ZoomBadgeInset.Right),
+                Math.Max(0, finalSize.Height - size.Height - ZoomBadgeInset.Bottom),
+                size.Width,
+                size.Height));
+        }
+
         return finalSize;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
+        _hasLoaded = true;
         GetScrollViewer();
         UpdatePagePadding();
     }
@@ -465,15 +587,37 @@ public sealed class MarkdownViewer : FrameworkElement
 
         _scrollViewer = FindVisualChild<ScrollViewer>(_host);
         if (_scrollViewer is not null)
+        {
             _scrollViewer.CanContentScroll = false;
+            _scrollViewer.ScrollChanged += OnScrollChanged;
+        }
 
         return _scrollViewer;
+    }
+
+    /// <summary>Records that the user is scrolling, so a sliced render can step aside.</summary>
+    private void OnScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        if (e.VerticalChange != 0 || e.HorizontalChange != 0)
+            _lastInteractionTimestamp = Stopwatch.GetTimestamp();
     }
 
     private void OnPreviewMouseWheel(object sender, MouseWheelEventArgs e)
     {
         if (e.Handled || e.Delta == 0)
             return;
+
+        _lastInteractionTimestamp = Stopwatch.GetTimestamp();
+
+        // FlowDocumentScrollViewer zooms on Ctrl+wheel only if the event reaches it, which made zoom
+        // work in some cases and not others. Handle the gesture here so it behaves the same way always.
+        if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+        {
+            var step = e.Delta > 0 ? ZoomStep : -ZoomStep;
+            Zoom += step;
+            e.Handled = true;
+            return;
+        }
 
         var scrollViewer = GetScrollViewer();
         if (scrollViewer is null ||
@@ -514,13 +658,13 @@ public sealed class MarkdownViewer : FrameworkElement
     private static void OnMarkdownChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is MarkdownViewer viewer)
-            viewer.RenderDocument(force: false);
+            viewer.RequestRender(force: false);
     }
 
     private static void OnRenderSettingsChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is MarkdownViewer viewer)
-            viewer.RenderDocument(force: true);
+            viewer.RequestRender(force: true);
     }
 
     private static void OnLayoutSettingsChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
@@ -533,6 +677,104 @@ public sealed class MarkdownViewer : FrameworkElement
     {
         if (d is MarkdownViewer viewer)
             viewer._host.IsSelectionEnabled = viewer.SelectionEnabled;
+    }
+
+    private static object CoerceZoom(DependencyObject d, object baseValue)
+    {
+        var value = (double)baseValue;
+
+        if (double.IsNaN(value))
+            return 100d;
+
+        return Math.Clamp(value, MinZoomPercent, MaxZoomPercent);
+    }
+
+    private static void OnZoomChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not MarkdownViewer viewer)
+            return;
+
+        viewer._host.Zoom = (double)e.NewValue;
+        viewer.ShowZoomBadge();
+    }
+
+    /// <summary>
+    /// Builds the badge on first use, then shows it for a moment so the zoom level is visible right after
+    /// a change. Doing it here rather than on every zoom property change keeps a zoomed document free of
+    /// extra visuals until the indicator is actually asked for.
+    /// </summary>
+    private void ShowZoomBadge()
+    {
+        // Zoom set from markup should not flash a badge before the window is even up.
+        if (!ShowZoomIndicator || !_hasLoaded)
+            return;
+
+        var badge = EnsureZoomBadge();
+        _zoomBadgeText!.Text = string.Format(
+            CultureInfo.CurrentCulture,
+            "{0:0}%",
+            Zoom);
+
+        badge.Visibility = Visibility.Visible;
+        GetZoomBadgeTimer().Start();
+    }
+
+    private Border EnsureZoomBadge()
+    {
+        if (_zoomBadge is not null)
+            return _zoomBadge;
+
+        _zoomBadgeText = new TextBlock { IsHitTestVisible = false };
+        _zoomBadge = new Border
+        {
+            Child = _zoomBadgeText,
+            IsHitTestVisible = false,
+            Visibility = Visibility.Collapsed
+        };
+
+        StyleZoomBadge();
+        AddVisualChild(_zoomBadge);
+
+        // The extra visual child changes the layout contract, so the next pass has to pick it up.
+        InvalidateMeasure();
+        return _zoomBadge;
+    }
+
+    private DispatcherTimer GetZoomBadgeTimer()
+    {
+        if (_zoomBadgeTimer is null)
+        {
+            _zoomBadgeTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(ZoomBadgeVisibleMilliseconds)
+            };
+
+            _zoomBadgeTimer.Tick += (_, _) =>
+            {
+                _zoomBadgeTimer!.Stop();
+
+                if (_zoomBadge is not null)
+                    _zoomBadge.Visibility = Visibility.Collapsed;
+            };
+        }
+
+        return _zoomBadgeTimer;
+    }
+
+    private void StyleZoomBadge()
+    {
+        if (_zoomBadge is null || _zoomBadgeText is null)
+            return;
+
+        _zoomBadge.Background = CodeBackground ?? DefaultCodeBackground;
+        _zoomBadge.BorderBrush = BorderBrush ?? DefaultBorder;
+        _zoomBadge.BorderThickness = new Thickness(1);
+        _zoomBadge.CornerRadius = new CornerRadius(6);
+        _zoomBadge.Padding = new Thickness(8, 3, 8, 3);
+
+        _zoomBadgeText.Foreground = SecondaryForeground ?? DefaultSecondaryForeground;
+        _zoomBadgeText.FontFamily = FontFamily ?? DefaultFontFamily;
+        _zoomBadgeText.FontSize = Math.Max(10, (FontSize > 0 ? FontSize : 14) * 0.8);
     }
 
     private static void OnBackgroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
@@ -560,6 +802,7 @@ public sealed class MarkdownViewer : FrameworkElement
         _document.LineStackingStrategy = LineStackingStrategy.MaxHeight;
         _host.Background = Background;
         _host.IsSelectionEnabled = SelectionEnabled;
+        StyleZoomBadge();
     }
 
     private void UpdatePagePadding()
@@ -602,7 +845,9 @@ public sealed class MarkdownViewer : FrameworkElement
 
     private void RenderDocument(bool force)
     {
-        if (_isRendering)
+        // A hidden viewer has nothing to paint. The render is deferred until it becomes visible, so a
+        // note being edited in write mode costs nothing in the preview.
+        if (IsLoaded && !IsVisible)
             return;
 
         var markdown = Markdown;
@@ -613,6 +858,20 @@ public sealed class MarkdownViewer : FrameworkElement
             return;
 
         force |= styleChanged;
+
+        // A slice render still in flight is dropped: the document is rebuilt from scratch below.
+        if (CancelPendingRender())
+        {
+            _blocks.Clear();
+            _document.Blocks.Clear();
+            _renderedMarkdown = string.Empty;
+            _parsedDocument = null;
+            _signatures = [];
+        }
+
+        if (_isRendering)
+            return;
+
         _isRendering = true;
 
         try
@@ -650,13 +909,19 @@ public sealed class MarkdownViewer : FrameworkElement
             }
 
             var preserveScrollOffset = force && oldBlocks.Count > 0 ? GetScrollViewer()?.VerticalOffset : null;
-
             var renderer = new MarkdownBlockRenderer(options, OnLinkActivated);
+
+            var changed = newSuffix - prefix;
+            if (newSuffix >= HeavyBlockThreshold && changed > SmallChangeThreshold)
+            {
+                StartSlicedRender(oldBlocks, prefix, oldSuffix, newSuffix, signatures, parsed, options, markdown, renderer, preserveScrollOffset);
+                return;
+            }
 
             for (var i = oldSuffix - 1; i >= prefix; i--)
                 _document.Blocks.Remove(oldBlocks[i].Block);
 
-            var rebuilt = new List<BlockEntry>(newSuffix - prefix);
+            var rebuilt = new List<BlockEntry>(changed);
             WpfBlock? anchor = prefix > 0 ? _document.Blocks.ElementAt(prefix - 1) : null;
             WpfBlock? firstSuffix = prefix < _document.Blocks.Count ? _document.Blocks.ElementAt(prefix) : null;
             var index = 0;
@@ -703,11 +968,193 @@ public sealed class MarkdownViewer : FrameworkElement
 
             if (preserveScrollOffset is double offset)
                 RestoreScrollOffset(offset);
+
+            RenderCompleted?.Invoke(this, EventArgs.Empty);
         }
         finally
         {
             _isRendering = false;
         }
+    }
+
+    /// <summary>
+    /// Builds a large document in slices. Each slice runs on the dispatcher at background priority so
+    /// input and scrolling are handled between slices instead of after the whole document is built.
+    /// </summary>
+    private void StartSlicedRender(
+        List<BlockEntry> oldBlocks,
+        int prefix,
+        int oldSuffix,
+        int newSuffix,
+        int[] signatures,
+        MarkdownDocument parsed,
+        MarkdownRenderOptions options,
+        string markdown,
+        MarkdownBlockRenderer renderer,
+        double? scrollOffset)
+    {
+        for (var i = oldSuffix - 1; i >= prefix; i--)
+            _document.Blocks.Remove(oldBlocks[i].Block);
+
+        _pendingRender = new RenderJob
+        {
+            Parsed = parsed,
+            Signatures = signatures,
+            Options = options,
+            Markdown = markdown,
+            OldBlocks = oldBlocks,
+            Prefix = prefix,
+            OldSuffix = oldSuffix,
+            NewSuffix = newSuffix,
+            ScrollOffset = scrollOffset,
+            Renderer = renderer,
+            Anchor = prefix > 0 ? _document.Blocks.ElementAt(prefix - 1) : null,
+            FirstSuffix = prefix < _document.Blocks.Count ? _document.Blocks.ElementAt(prefix) : null,
+            Index = prefix,
+            BlocksPerSlice = Math.Max(
+                MinBlocksPerSlice,
+                (int)Math.Ceiling((newSuffix - prefix) / (double)SliceTargetCount))
+        };
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ContinueSlicedRender));
+    }
+
+    private void ContinueSlicedRender()
+    {
+        var job = _pendingRender;
+        if (job is null)
+            return;
+
+        // While the user is scrolling, finish the document later: competing for the UI thread is what
+        // makes a freshly opened large note feel stuck until the render happens to complete.
+        if (Stopwatch.GetElapsedTime(_lastInteractionTimestamp).TotalMilliseconds < InteractionQuietMilliseconds)
+        {
+            ScheduleSliceResume();
+            return;
+        }
+
+        var slice = Stopwatch.StartNew();
+        var sliceEnd = Math.Min(job.NewSuffix, job.Index + job.BlocksPerSlice);
+
+        while (job.Index < sliceEnd && slice.ElapsedMilliseconds < RenderSliceMilliseconds)
+        {
+            var block = job.Renderer.Create(job.Parsed[job.Index]);
+
+            if (job.Anchor is not null)
+            {
+                _document.Blocks.InsertAfter(job.Anchor, block);
+                job.Anchor = block;
+            }
+            else if (job.FirstSuffix is not null)
+            {
+                _document.Blocks.InsertBefore(job.FirstSuffix, block);
+            }
+            else
+            {
+                _document.Blocks.Add(block);
+            }
+
+            job.Rebuilt.Add(new BlockEntry(job.Signatures[job.Index], block));
+            job.Index++;
+        }
+
+        if (job.Index < job.NewSuffix)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ContinueSlicedRender));
+            return;
+        }
+
+        CompleteSlicedRender(job);
+    }
+
+    private void CompleteSlicedRender(RenderJob job)
+    {
+        var combined = new List<BlockEntry>(job.Signatures.Length);
+        for (var i = 0; i < job.Prefix; i++)
+            combined.Add(job.OldBlocks[i]);
+        combined.AddRange(job.Rebuilt);
+        for (var i = job.OldSuffix; i < job.OldBlocks.Count; i++)
+            combined.Add(job.OldBlocks[i]);
+
+        _blocks.Clear();
+        _blocks.AddRange(combined);
+        _renderedMarkdown = job.Markdown;
+        _parsedDocument = job.Parsed;
+        _signatures = job.Signatures;
+        _options = job.Options;
+        _pendingRender = null;
+
+        if (job.ScrollOffset is double offset)
+            RestoreScrollOffset(offset);
+
+        RenderCompleted?.Invoke(this, EventArgs.Empty);
+    }
+
+    private bool CancelPendingRender()
+    {
+        if (_pendingRender is null)
+            return false;
+
+        _pendingRender = null;
+        return true;
+    }
+
+    /// <summary>Restarts a paused slice once the pointer has been quiet briefly.</summary>
+    private void ScheduleSliceResume()
+    {
+        if (_slicePauseTimer is not null)
+            return;
+
+        _slicePauseTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(SliceResumeDelayMilliseconds)
+        };
+
+        _slicePauseTimer.Tick += (_, _) =>
+        {
+            _slicePauseTimer?.Stop();
+            _slicePauseTimer = null;
+
+            if (_pendingRender is not null)
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ContinueSlicedRender));
+        };
+
+        _slicePauseTimer.Start();
+    }
+
+    /// <summary>
+    /// Runs a render now, or queues one behind pending input when <see cref="RenderOnInputIdle"/> is set.
+    /// Queued requests collapse, so typing quickly costs one render instead of one per keystroke.
+    /// </summary>
+    private void RequestRender(bool force)
+    {
+        if (IsLoaded && !IsVisible)
+            return;
+
+        if (!RenderOnInputIdle)
+        {
+            RenderDocument(force);
+            return;
+        }
+
+        _queuedRenderForced |= force;
+        if (_renderQueued)
+            return;
+
+        _renderQueued = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            _renderQueued = false;
+            var queuedForce = _queuedRenderForced;
+            _queuedRenderForced = false;
+            RenderDocument(queuedForce);
+        }));
+    }
+
+    private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (IsVisible)
+            RequestRender(force: false);
     }
 
     private void RestoreScrollOffset(double offset)
@@ -757,4 +1204,38 @@ public sealed class MarkdownViewer : FrameworkElement
     internal readonly record struct BlockEntry(int Signature, WpfBlock Block);
 
     internal IReadOnlyList<BlockEntry> CachedBlocks => _blocks;
+
+    /// <summary>State of a document that is being built in slices.</summary>
+    private sealed class RenderJob
+    {
+        public required MarkdownDocument Parsed { get; init; }
+
+        public required int[] Signatures { get; init; }
+
+        public required MarkdownRenderOptions Options { get; init; }
+
+        public required string Markdown { get; init; }
+
+        public required List<BlockEntry> OldBlocks { get; init; }
+
+        public required int Prefix { get; init; }
+
+        public required int OldSuffix { get; init; }
+
+        public required int NewSuffix { get; init; }
+
+        public required MarkdownBlockRenderer Renderer { get; init; }
+
+        public required int Index { get; set; }
+
+        public required int BlocksPerSlice { get; init; }
+
+        public double? ScrollOffset { get; init; }
+
+        public WpfBlock? Anchor { get; set; }
+
+        public WpfBlock? FirstSuffix { get; init; }
+
+        public List<BlockEntry> Rebuilt { get; } = [];
+    }
 }
